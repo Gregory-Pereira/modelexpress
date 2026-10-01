@@ -5,11 +5,13 @@ pub mod auth;
 pub mod backend_config;
 pub mod cache;
 pub mod config;
+pub mod metrics;
 pub mod p2p;
 pub mod refit;
 pub mod registry;
 pub mod server;
 pub mod services;
+pub mod tls;
 
 // Re-export for testing
 pub use cache::*;

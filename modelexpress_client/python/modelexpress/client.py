@@ -41,6 +41,10 @@ class MxClientBase(ABC):
 
     REQUIRES_P2P_METADATA: bool = False
 
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Return fresh-channel retries and backoff for worker RPCs."""
+        return 0, 0.0
+
     @abstractmethod
     def publish_metadata(
         self,
@@ -73,6 +77,7 @@ class MxClientBase(ABC):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update a source worker's lifecycle status."""
 
@@ -90,6 +95,41 @@ def _parse_server_address(address: str) -> str:
     return address
 
 
+def _raw_server_url(explicit_url: str | None = None) -> str:
+    """The configured server address before the scheme is stripped."""
+    if explicit_url:
+        return explicit_url
+    url = envs.MODEL_EXPRESS_URL
+    if url is None:
+        url = envs.MX_SERVER_ADDRESS
+        if url is None:
+            url = "localhost:8001"
+    return url
+
+
+def _tls_requested(explicit_url: str | None = None) -> bool:
+    """TLS is on for an ``https://`` address or when a CA bundle is configured."""
+    return _raw_server_url(explicit_url).startswith("https://") or bool(
+        envs.MX_TLS_CA_FILE
+    )
+
+
+def _channel_credentials() -> grpc.ChannelCredentials:
+    """Client credentials trusting ``MX_TLS_CA_FILE``, else system roots."""
+    ca_file = envs.MX_TLS_CA_FILE
+    if not ca_file:
+        return grpc.ssl_channel_credentials()
+    with open(ca_file, "rb") as handle:
+        return grpc.ssl_channel_credentials(root_certificates=handle.read())
+
+
+def open_channel(target: str, *, tls: bool, options: list[tuple[str, object]]) -> grpc.Channel:
+    """Create the gRPC channel for ``target`` (``host:port``), secure when ``tls``."""
+    if tls:
+        return grpc.secure_channel(target, _channel_credentials(), options=options)
+    return grpc.insecure_channel(target, options=options)
+
+
 def _get_server_url(explicit_url: str | None = None) -> str:
     """
     Resolve the ModelExpress server URL.
@@ -101,14 +141,7 @@ def _get_server_url(explicit_url: str | None = None) -> str:
     3. ``MX_SERVER_ADDRESS`` env var (the name ModelExpress is standardizing on)
     4. Default ``localhost:8001``
     """
-    if explicit_url:
-        return _parse_server_address(explicit_url)
-    url = envs.MODEL_EXPRESS_URL
-    if url is None:
-        url = envs.MX_SERVER_ADDRESS
-        if url is None:
-            url = "localhost:8001"
-    return _parse_server_address(url)
+    return _parse_server_address(_raw_server_url(explicit_url))
 
 
 class MxClient(MxClientBase):
@@ -136,6 +169,7 @@ class MxClient(MxClientBase):
         max_message_size: int = 100 * 1024 * 1024,  # 100 MB
     ):
         self.server_url = _get_server_url(server_url)
+        self._tls = _tls_requested(server_url)
         self._max_message_size = max_message_size
         self._channel: grpc.Channel | None = None
         self._stub: p2p_pb2_grpc.P2pServiceStub | None = None
@@ -151,7 +185,7 @@ class MxClient(MxClientBase):
                 ("grpc.max_receive_message_length", self._max_message_size),
             ]
             self._channel = auth.with_auth(
-                grpc.insecure_channel(self.server_url, options=options)
+                open_channel(self.server_url, tls=self._tls, options=options)
             )
             self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
             logger.debug("MxClient connected to %s", self.server_url)
@@ -219,6 +253,7 @@ class MxClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
@@ -227,6 +262,10 @@ class MxClient(MxClientBase):
             worker_rank=worker_rank,
             status=status,
         )
+        # Leave the optional field unset when there is no reading: presence is
+        # how the server and pullers tell "unknown" from a measured 0.0.
+        if source_load is not None:
+            request.source_load = source_load
         response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)

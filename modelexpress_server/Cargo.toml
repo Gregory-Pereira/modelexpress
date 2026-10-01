@@ -14,31 +14,51 @@ keywords.workspace = true
 
 
 [features]
+default = ["gcs", "tls-rustls"]
+openssl = ["tls-openssl"]
+gcs = ["modelexpress-common/gcs"]
 # In-memory backend for tests and local dev (MX_METADATA_BACKEND=memory). Off by
 # default; enable explicitly with `--features memory-backend` to run its unit tests.
 memory-backend = []
 # Gates the in-process integration tests, which boot a server and are slower. Enables
 # memory-backend because the test boots run_server with MX_METADATA_BACKEND=memory.
 integration-tests = ["memory-backend"]
+tls-openssl = [
+    "modelexpress-common/tls-native",
+    "modelexpress-client/tls-native",
+    "kube/openssl-tls",
+    "dep:openssl",
+    "dep:tokio-openssl",
+]
+tls-rustls = [
+    "modelexpress-common/tls-rustls",
+    "kube/rustls-tls",
+    "dep:rustls",
+    "rustls/ring",
+    "rustls/std",
+    "rustls/tls12",
+    "dep:tokio-rustls",
+]
 
 [dependencies]
-modelexpress-common = { workspace = true }
+modelexpress-common = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 futures = { workspace = true }
-hf-hub = { workspace = true }
-jiff = { workspace = true }
-once_cell = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-toml = "0.9"
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -57,14 +77,14 @@ tower = { workspace = true }
 http = { workspace = true }
 moka = { workspace = true }
 secrecy = { workspace = true }
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
-modelexpress-common = { workspace = true, features = ["test-support"] }
+modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 mockall = { workspace = true }
 tempfile = "3.20"
-tokio-test = "0.4"
-tonic-build = { workspace = true }
-modelexpress-client.workspace = true
+modelexpress-client = { workspace = true, features = ["tls-rustls"] }
+rcgen = { workspace = true }
 
 [[test]]
 name = "in_process_server"
@@ -74,6 +94,11 @@ required-features = ["integration-tests"]
 [[test]]
 name = "auth_e2e"
 path = "tests/auth_e2e.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "tls_e2e"
+path = "tests/tls_e2e.rs"
 required-features = ["integration-tests"]
 
 [lints]

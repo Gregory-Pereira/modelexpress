@@ -4,6 +4,7 @@
 use clap::Parser;
 use config::ConfigError;
 use modelexpress_common::config::{LogFormat, LogLevel, load_layered_config};
+use modelexpress_common::tls::TlsVersion;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
@@ -158,6 +159,89 @@ pub struct SecurityArgs {
     pub cache_ttl_secs: Option<u64>,
 }
 
+/// TLS termination for the gRPC listener. Off unless a certificate is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// PEM certificate chain to serve.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key for `cert_file`.
+    pub key_file: Option<PathBuf>,
+    /// Lowest protocol version accepted. OpenSSL's default when unset.
+    pub min_version: Option<TlsVersion>,
+    /// OpenSSL cipher names to offer, TLS 1.2 and 1.3 names mixed as in an
+    /// OpenShift `tlsSecurityProfile`. OpenSSL's default when empty.
+    pub cipher_suites: Vec<String>,
+    /// Key exchange groups to offer, in preference order, as OpenSSL names
+    /// (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL
+    /// does not know are dropped with a warning. OpenSSL's default when empty.
+    pub groups: Vec<String>,
+}
+
+impl TlsConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.cert_file.is_some() || self.key_file.is_some()
+    }
+
+    /// Certificate and key paths when TLS is on.
+    pub fn key_pair(&self) -> Result<Option<(&PathBuf, &PathBuf)>, String> {
+        match (&self.cert_file, &self.key_file) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("tls.cert_file is set without tls.key_file".to_string()),
+            (None, Some(_)) => Err("tls.key_file is set without tls.cert_file".to_string()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let Some((cert, key)) = self.key_pair()? else {
+            if self.min_version.is_some()
+                || !self.cipher_suites.is_empty()
+                || !self.groups.is_empty()
+            {
+                return Err(
+                    "tls.min_version, tls.cipher_suites and tls.groups need tls.cert_file and tls.key_file"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        };
+        for (name, path) in [("tls.cert_file", cert), ("tls.key_file", key)] {
+            if !path.is_file() {
+                return Err(format!("{name} does not exist: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct TlsArgs {
+    /// PEM certificate chain for the gRPC listener. Enables TLS.
+    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MX_TLS_CERT_FILE)]
+    pub cert_file: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert-file.
+    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MX_TLS_KEY_FILE)]
+    pub key_file: Option<PathBuf>,
+
+    /// Minimum TLS version (TLS1.2, TLS1.3, or the OpenShift VersionTLS12 spelling).
+    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MX_TLS_MIN_VERSION)]
+    pub min_version: Option<TlsVersion>,
+
+    /// Comma-separated OpenSSL cipher names, TLS 1.2 and 1.3 names mixed.
+    #[arg(
+        long = "tls-cipher-suites",
+        env = modelexpress_common::envs::MX_TLS_CIPHER_SUITES
+    )]
+    pub cipher_suites: Option<CommaList<String>>,
+
+    /// Comma-separated key exchange groups in preference order (OpenSSL names).
+    #[arg(long = "tls-groups", env = modelexpress_common::envs::MX_TLS_GROUPS)]
+    pub groups: Option<CommaList<String>>,
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -173,6 +257,18 @@ pub struct ServerArgs {
     /// Server host address
     #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_HOST)]
     pub host: Option<String>,
+
+    // This clap override is the ONLY path that reaches
+    // `ServerSettings::metrics_port`. The layered config loader builds its
+    // environment source as
+    // `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+    // `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+    // `server.metrics.port`, matches no field, and is dropped by serde without a
+    // warning. Do not "simplify" this by deleting the override. Kept as a plain
+    // comment rather than a doc comment so it stays out of `--help`.
+    /// Prometheus `/metrics` port. `0` disables the metrics listener.
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_METRICS_PORT)]
+    pub metrics_port: Option<u16>,
 
     /// Log level
     #[arg(short, long, env = modelexpress_common::envs::MODEL_EXPRESS_LOG_LEVEL, value_enum)]
@@ -193,6 +289,9 @@ pub struct ServerArgs {
     #[command(flatten)]
     pub security: SecurityArgs,
 
+    #[command(flatten)]
+    pub tls: TlsArgs,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -209,6 +308,8 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 /// Server-specific settings
@@ -218,6 +319,31 @@ pub struct ServerSettings {
     pub host: String,
     /// Server port
     pub port: NonZeroU16,
+    /// Prometheus `/metrics` port. `0` disables the listener.
+    ///
+    /// Two properties here are load-bearing, and both exist because
+    /// `load_layered_config` swallows any deserialization error and silently
+    /// returns `T::default()` — so anything this field rejects is not "the
+    /// field is ignored" but "the entire config file is ignored", with no log
+    /// line at any level. The gRPC port, cache directory, eviction policy and
+    /// **auth settings** would all revert to defaults because of a typo here.
+    ///
+    /// 1. `#[serde(default)]` covers the missing-key case. `ServerSettings` has
+    ///    no struct-level default, so without it every existing
+    ///    `model-express.yaml` — none of which mention this field — would fail
+    ///    to parse.
+    /// 2. The type is `u16`, not `NonZeroU16`. `0` is the documented disable
+    ///    value, and `NonZeroU16` rejects it during deserialization, which is
+    ///    exactly the silent-total-fallback case above. Normalization to
+    ///    "disabled" happens in [`ServerConfig::metrics_socket_addr`].
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+}
+
+/// Serde default for [`ServerSettings::metrics_port`]. Server metrics are on by
+/// default; the client's stay opt-in.
+fn default_metrics_port() -> u16 {
+    modelexpress_common::constants::DEFAULT_METRICS_PORT.get()
 }
 
 /// Cache configuration wrapper
@@ -251,6 +377,7 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
+            metrics_port: default_metrics_port(),
         }
     }
 }
@@ -311,6 +438,12 @@ impl ServerConfig {
             config.server.host = host;
         }
 
+        // `0` is the documented "off" value. Env-only deployments (Helm) have no
+        // other way to turn the listener off.
+        if let Some(metrics_port) = args.metrics_port {
+            config.server.metrics_port = metrics_port;
+        }
+
         if let Some(log_level) = args.log_level {
             config.logging.level = log_level;
         }
@@ -342,6 +475,23 @@ impl ServerConfig {
             config.security.cache_ttl_secs = cache_ttl_secs;
         }
 
+        // Apply TLS overrides
+        if let Some(cert_file) = args.tls.cert_file {
+            config.tls.cert_file = Some(cert_file);
+        }
+        if let Some(key_file) = args.tls.key_file {
+            config.tls.key_file = Some(key_file);
+        }
+        if let Some(min_version) = args.tls.min_version {
+            config.tls.min_version = Some(min_version);
+        }
+        if let Some(cipher_suites) = args.tls.cipher_suites {
+            config.tls.cipher_suites = cipher_suites.into_inner();
+        }
+        if let Some(groups) = args.tls.groups {
+            config.tls.groups = groups.into_inner();
+        }
+
         // Validate the final configuration
         config.validate()?;
 
@@ -365,6 +515,8 @@ impl ServerConfig {
             .validate_resolved(mode)
             .map_err(ConfigError::Message)?;
 
+        self.tls.validate().map_err(ConfigError::Message)?;
+
         Ok(())
     }
 
@@ -373,6 +525,24 @@ impl ServerConfig {
         let addr = format!("{}:{}", self.server.host, self.server.port);
         addr.parse()
             .map_err(|e| ConfigError::Message(format!("Invalid server address {addr}: {e}")))
+    }
+
+    /// Socket address for the Prometheus `/metrics` listener, or `None` when
+    /// metrics are disabled.
+    ///
+    /// # Errors
+    /// Returns an error when host and metrics port do not form a valid address.
+    pub fn metrics_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        // `0` is the disable sentinel. Normalizing here rather than in the field
+        // type keeps `0` deserializable from a config file; see
+        // `ServerSettings::metrics_port`.
+        let Some(metrics_port) = NonZeroU16::new(self.server.metrics_port) else {
+            return Ok(None);
+        };
+        let addr = format!("{}:{}", self.server.host, metrics_port);
+        addr.parse()
+            .map(Some)
+            .map_err(|e| ConfigError::Message(format!("Invalid metrics address {addr}: {e}")))
     }
 
     /// Get the logging level as a tracing Level
@@ -387,6 +557,10 @@ impl ServerConfig {
         info!("Server Configuration:");
         info!("  Host: {}", self.server.host);
         info!("  Port: {}", self.server.port);
+        match NonZeroU16::new(self.server.metrics_port) {
+            Some(port) => info!("  Metrics Port: {port} (/metrics)"),
+            None => info!("  Metrics Port: disabled"),
+        }
 
         info!("Cache Configuration:");
         info!("  Directory: {}", self.cache.directory.display());
@@ -416,6 +590,30 @@ impl ServerConfig {
                 .join(", ")
         );
         info!("  Cache TTL: {}s", self.security.cache_ttl_secs);
+
+        info!("TLS Configuration:");
+        match self.tls.key_pair() {
+            Ok(Some((cert, key))) => {
+                info!("  Certificate: {}", cert.display());
+                info!("  Key: {}", key.display());
+                match self.tls.min_version {
+                    Some(version) => info!("  Min version: {version}"),
+                    None => info!("  Min version: OpenSSL default"),
+                }
+                if self.tls.cipher_suites.is_empty() {
+                    info!("  Cipher suites: OpenSSL default");
+                } else {
+                    info!("  Cipher suites: {}", self.tls.cipher_suites.join(":"));
+                }
+                if self.tls.groups.is_empty() {
+                    info!("  Groups: OpenSSL default");
+                } else {
+                    info!("  Groups: {}", self.tls.groups.join(":"));
+                }
+            }
+            Ok(None) => info!("  Disabled (plaintext gRPC)"),
+            Err(e) => info!("  Invalid: {e}"),
+        }
     }
 }
 
@@ -676,11 +874,13 @@ mod tests {
             config: Some(config_file),
             port: None,
             host: None,
+            metrics_port: None,
             log_level: None,
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -716,11 +916,13 @@ mod tests {
             config: Some(config_file),
             port: None,
             host: None,
+            metrics_port: None,
             log_level: None,
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -762,11 +964,13 @@ mod tests {
             config: Some(config_file),
             port: Some(NonZeroU16::new(9000).expect("9000 is non-zero")),
             host: Some("0.0.0.0".to_string()),
+            metrics_port: None,
             log_level: Some(LogLevel::Error),
             log_format: Some(LogFormat::Json),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -790,11 +994,13 @@ mod tests {
             config: None,
             port: Some(NonZeroU16::new(9001).expect("9001 is non-zero")),
             host: Some("localhost".to_string()),
+            metrics_port: None,
             log_level: Some(LogLevel::Warn),
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -864,5 +1070,112 @@ mod tests {
             service_account: "worker".to_string(),
         }];
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
+    }
+
+    /// A config file must survive both spellings of the metrics port.
+    ///
+    /// `load_layered_config` swallows every deserialization error and returns
+    /// `T::default()` with no log line, so any value this field rejects costs the
+    /// operator the gRPC port, the cache directory, the eviction policy and the
+    /// auth settings -- silently. That is why `metrics_port` is a `u16` and not a
+    /// `NonZeroU16` (`0` has to deserialize, and is normalized afterwards), and
+    /// why it carries `#[serde(default)]` (no existing model-express.yaml mentions
+    /// it). Both cases assert the *rest* of the file survived, because that is how
+    /// the failure would present.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn metrics_port_never_costs_the_rest_of_the_config_file() {
+        // (metrics_port line, expected port, expected metrics address)
+        let cases = [
+            ("metrics_port: 0", 0_u16, None),
+            ("", default_metrics_port(), Some(default_metrics_port())),
+        ];
+
+        for (metrics_line, expected_metrics_port, expects_addr) in cases {
+            let temp_dir = tempdir().expect("Failed to create temp dir");
+            let config_file = temp_dir.path().join("metrics_port.yaml");
+            fs::write(
+                &config_file,
+                format!(
+                    r#"
+            server:
+              host: "127.0.0.1"
+              port: 18012
+              {metrics_line}
+            cache:
+              eviction:
+                enabled: false
+                policy:
+                  type: lru
+                  unused_threshold: "3d"
+                  max_models: 10
+                  min_free_space_bytes: 1000000
+                check_interval: "30m"
+              directory: "./cache"
+              max_size_bytes: 5000000
+            logging:
+              level: Debug
+              format: Json
+              file: null
+              structured: true
+        "#
+                ),
+            )
+            .expect("Failed to write config file");
+
+            let args = ServerArgs {
+                config: Some(config_file),
+                port: None,
+                host: None,
+                metrics_port: None,
+                log_level: None,
+                log_format: None,
+                cache_directory: None,
+                cache_eviction_enabled: None,
+                security: SecurityArgs::default(),
+                tls: TlsArgs::default(),
+                validate_config: false,
+            };
+            let config = ServerConfig::load(args).expect("config should load");
+
+            assert_eq!(config.server.metrics_port, expected_metrics_port);
+            assert_eq!(
+                config
+                    .metrics_socket_addr()
+                    .expect("metrics address should resolve")
+                    .map(|addr| addr.port()),
+                expects_addr,
+                "0 must mean disabled and nothing else"
+            );
+            // The rest of the file survived. If this regresses these fail
+            // together, because the whole file was dropped.
+            assert_eq!(config.server.port.get(), 18012, "the file was dropped");
+            assert_eq!(config.server.host, "127.0.0.1");
+            assert!(!config.cache.eviction.enabled);
+            assert_eq!(config.logging.level, LogLevel::Debug);
+        }
+    }
+
+    /// The env var must stay wired through clap.
+    ///
+    /// `load_layered_config` reads env as
+    /// `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+    /// `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+    /// `server.metrics.port`, matches no field, and serde drops it without a
+    /// warning. The clap `#[arg(env = ...)]` override is the only path that
+    /// reaches the field, and `--metrics-port` is what the Helm chart drives.
+    #[test]
+    fn metrics_port_is_reachable_from_the_command_line() {
+        use clap::Parser as _;
+
+        let args = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "9999"]);
+        assert_eq!(args.metrics_port, Some(9999));
+
+        let off = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "0"]);
+        assert_eq!(
+            off.metrics_port,
+            Some(0),
+            "0 is the documented disable value"
+        );
     }
 }

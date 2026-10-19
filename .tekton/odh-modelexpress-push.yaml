@@ -35,8 +35,7 @@ spec:
     value: |
       [
         {"type": "cargo", "path": "."},
-        {"type": "rpm", "path": "docker/konflux/server"},
-        {"type": "generic", "path": "docker/konflux/server", "lockfile": "generic-fetcher.yaml"}
+        {"type": "rpm", "path": "docker/konflux/server"}
       ]
   pipelineRef:
     resolver: git

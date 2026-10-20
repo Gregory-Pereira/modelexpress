@@ -6,8 +6,8 @@
 //! Computes a 16-char hex `mx_source_id` from a `SourceIdentity` proto by
 //! normalizing all fields and taking the first 16 chars of SHA256.
 
+use modelexpress_common::digest::sha256_hex;
 use modelexpress_common::grpc::p2p::SourceIdentity;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Compute the `mx_source_id` for a `SourceIdentity`.
@@ -16,8 +16,7 @@ use std::collections::BTreeMap;
 /// with SHA256. Returns the first 16 hex characters of the digest.
 pub fn compute_mx_source_id(identity: &SourceIdentity) -> String {
     let canonical = canonical_json(identity);
-    let digest = Sha256::digest(canonical.as_bytes());
-    format!("{:x}", digest)[..16].to_string()
+    sha256_hex(canonical.as_bytes())[..16].to_string()
 }
 
 /// Validate that a `SourceIdentity` has required fields set.

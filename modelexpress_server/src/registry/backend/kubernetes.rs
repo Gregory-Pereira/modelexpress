@@ -22,7 +22,6 @@ use kube::{
 };
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Mutex, PoisonError},
@@ -143,13 +142,7 @@ fn sanitize_registry_name(model_name: &str) -> String {
 }
 
 fn hex_sha256(s: &str) -> String {
-    let digest = Sha256::digest(s.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    modelexpress_common::digest::sha256_hex(s.as_bytes())
 }
 
 pub struct KubernetesRegistryBackend {

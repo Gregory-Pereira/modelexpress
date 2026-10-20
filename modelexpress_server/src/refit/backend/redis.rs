@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use modelexpress_common::digest::sha256;
 use modelexpress_common::grpc::refit::{
     CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionShardRequest, ObjectStorageSource, ObjectStorageType,
@@ -18,7 +19,6 @@ use modelexpress_common::grpc::refit::{
 use prost::Message;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{RefitBackend, RefitBackendError, RefitResult};
@@ -80,7 +80,7 @@ fn idempotency_key(model_name: &str, request_key: &str) -> String {
 }
 
 fn lease_id(version_id: &str, worker_id: &str) -> String {
-    let digest = Sha256::digest(format!("{version_id}\0{worker_id}").as_bytes());
+    let digest = sha256(format!("{version_id}\0{worker_id}").as_bytes());
     let mut id = String::with_capacity(8);
     for byte in &digest[..4] {
         let _ = write!(id, "{byte:02x}");

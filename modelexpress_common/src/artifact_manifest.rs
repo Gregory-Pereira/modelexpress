@@ -119,7 +119,7 @@ impl ArtifactManifest {
         let canonical =
             serde_json::to_vec(self).context("failed to serialize artifact manifest")?;
         Ok(SealedArtifactManifest {
-            artifact_id: crate::digest::sha256_hex(&canonical),
+            artifact_id: crate::digest::sha256_hex(&canonical)?,
             manifest: self.clone(),
         })
     }

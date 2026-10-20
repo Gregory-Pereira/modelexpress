@@ -4,10 +4,23 @@
 //! SHA-256, from OpenSSL in the build that ships, so the validated library
 //! does the hashing there and no pure-Rust digest crate reaches the binary.
 
+/// # Panics
+///
+/// When OpenSSL has no usable SHA-256 provider, e.g. the FIPS provider failed
+/// its self-tests. `openssl::sha::sha256` would return an unwritten buffer
+/// there; failing closed keeps every derived ID from collapsing to one value.
 #[cfg(feature = "tls-native")]
 #[must_use]
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    openssl::sha::sha256(bytes)
+    use openssl::hash::{MessageDigest, hash};
+    match hash(MessageDigest::sha256(), bytes) {
+        Ok(digest) => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest);
+            out
+        }
+        Err(err) => panic!("OpenSSL SHA-256 failed: {err}"),
+    }
 }
 
 #[cfg(not(feature = "tls-native"))]
